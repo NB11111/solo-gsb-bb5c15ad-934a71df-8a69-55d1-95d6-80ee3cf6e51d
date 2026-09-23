@@ -1789,3 +1789,255 @@ def test_drift_risk_single_carrier_site_has_no_sources(client):
     assert resp.status_code == 200
     assert resp.json()["risk_count"] == 0
     assert resp.json()["risks"] == []
+
+
+# ---------------------------------------------------------------- 站点历史风险
+
+def _set_analysis_products(client, analysis_id, products):
+    """直接改写已保存分析的产物（测试构造历史违规形态，不经过分析计算）。"""
+    import json
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        con.execute(
+            "UPDATE analyses SET result_json = ?, product_count = ? WHERE id = ?",
+            (json.dumps(products), len(products), analysis_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _mark_violations(client, analysis_id, violating_freqs):
+    """把该分析中指定频率标记为违规，其余标记为非违规。"""
+    products = client.get(f"/analyses/{analysis_id}").json()["products"]
+    for product in products:
+        product["violates_guard_interval"] = product["freq_hz"] in violating_freqs
+    _set_analysis_products(client, analysis_id, products)
+
+
+def _set_analysis_created_at(client, analysis_id, created_at):
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        con.execute(
+            "UPDATE analyses SET created_at = ? WHERE id = ?", (created_at, analysis_id)
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_risk_history_counts_last_seen_and_consecutive_streak(client):
+    # 默认站点产物为 200(违规)/500(违规)/700(非违规)。4 条分析（旧 -> 新）：
+    #   a0:{200}  a1:{500}  a2:{200,500}  a3:{200}
+    # 200：违规 3 次，最近为 a3，连续违规从 a3 起经 a2 到 a1 中断 -> 2
+    # 500：违规 2 次，最近为 a2，最新 a3 即非违规 -> 连续 0
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 4)
+    a0, a1, a2, a3 = ids
+    _mark_violations(client, a0, {200})
+    _mark_violations(client, a1, {500})
+    _mark_violations(client, a2, {200, 500})
+    _mark_violations(client, a3, {200})
+    created_at = {
+        m["analysis_id"]: m["created_at"]
+        for m in client.get("/sites/1/analyses").json()
+    }
+
+    resp = client.get("/sites/1/risk-history", params={"limit": 4})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == [
+        {
+            "freq_hz": 200,
+            "violation_count": 3,
+            "last_violated_at": created_at[a3],
+            "consecutive_count": 2,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 2,
+            "last_violated_at": created_at[a2],
+            "consecutive_count": 0,
+        },
+    ]
+
+
+def test_risk_history_limit_takes_recent_window(client):
+    # 同上 4 条历史，limit 只取最近 N 条：统计范围与连续计数都不越过窗口
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 4)
+    a0, a1, a2, a3 = ids
+    _mark_violations(client, a0, {200})
+    _mark_violations(client, a1, {500})
+    _mark_violations(client, a2, {200, 500})
+    _mark_violations(client, a3, {200})
+    created_at = {
+        m["analysis_id"]: m["created_at"]
+        for m in client.get("/sites/1/analyses").json()
+    }
+
+    # 窗口 [a3, a2]：200 两次全中且连续 2；500 仅 a2 一次，最新 a3 非违规 -> 0
+    body = client.get("/sites/1/risk-history", params={"limit": 2}).json()
+    assert body == [
+        {
+            "freq_hz": 200,
+            "violation_count": 2,
+            "last_violated_at": created_at[a3],
+            "consecutive_count": 2,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 1,
+            "last_violated_at": created_at[a2],
+            "consecutive_count": 0,
+        },
+    ]
+
+    # 窗口仅 [a3]：500 在窗口内未违规，不出现在结果中
+    body = client.get("/sites/1/risk-history", params={"limit": 1}).json()
+    assert body == [
+        {
+            "freq_hz": 200,
+            "violation_count": 1,
+            "last_violated_at": created_at[a3],
+            "consecutive_count": 1,
+        }
+    ]
+
+    # limit 大于分析总数：等价于取全部历史
+    body = client.get("/sites/1/risk-history", params={"limit": 100}).json()
+    assert [e["freq_hz"] for e in body] == [200, 500]
+    assert body[0]["violation_count"] == 3
+
+
+def test_risk_history_orders_by_created_at_then_id(client):
+    # 最近 N 条按 created_at 主、id 辅倒序选取：令 a0 与 a2 同一时刻（id 大者
+    # 为新），a1 更旧。limit=2 的窗口为 [a2, a0] 而非 [a1, ...]。
+    client.post("/sites", json=make_payload())
+    a0, a1, a2 = _create_n_analyses(client, 1, 3)
+    _mark_violations(client, a0, {200})
+    _mark_violations(client, a1, {500})
+    _mark_violations(client, a2, {200, 500})
+    ts_tie = "2026-03-01T00:00:00.000Z"
+    _set_analysis_created_at(client, a0, ts_tie)
+    _set_analysis_created_at(client, a2, ts_tie)
+    _set_analysis_created_at(client, a1, "2026-01-01T00:00:00.000Z")
+
+    body = client.get("/sites/1/risk-history", params={"limit": 2}).json()
+    assert body == [
+        {
+            "freq_hz": 200,
+            "violation_count": 2,
+            "last_violated_at": ts_tie,
+            "consecutive_count": 2,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 1,  # 仅 a2；a1 落在窗口外
+            "last_violated_at": ts_tie,
+            # 最新 a2 违规，次新 a0 非违规即终止 -> 1（若并列时刻误用 id 升序，
+            # 窗口顺序变成 [a0, a2]，连续数会错误地为 0）
+            "consecutive_count": 1,
+        },
+    ]
+
+
+def test_risk_history_empty_for_no_analysis_or_no_violation(client):
+    # 站点存在但无任何分析：空列表（200，不报错）
+    client.post("/sites", json=make_payload())
+    resp = client.get("/sites/1/risk-history", params={"limit": 10})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+    # guard_interval_hz=0：所有产物都非违规，窗口内无违规频率 -> 空列表
+    client.post("/sites", json=make_payload(name="site-b", guard_interval_hz=0))
+    _create_n_analyses(client, 2, 3)
+    resp = client.get("/sites/2/risk-history", params={"limit": 3})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_risk_history_read_only_does_not_trigger_analysis(client):
+    # 只读已保存结果：调用前后分析记录完全不变，不产生新分析
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 2)
+    before = client.get("/sites/1/analyses").json()
+    for _ in range(3):
+        resp = client.get("/sites/1/risk-history", params={"limit": 1})
+        assert resp.status_code == 200
+    assert client.get("/sites/1/analyses").json() == before
+    assert client.get("/sites/1/analysis").json()["analysis_id"] == ids[-1]
+
+
+def test_risk_history_404_missing_site(client):
+    assert client.get("/sites/999/risk-history", params={"limit": 1}).status_code == 404
+
+
+def test_risk_history_422_invalid_limit(client):
+    client.post("/sites", json=make_payload())
+    url = "/sites/1/risk-history"
+    # 缺少 limit
+    assert client.get(url).status_code == 422
+    # 越界（0、负数、101）/ 非整数 -> 422
+    for bad in (0, -1, 101, 1000, "abc", 1.5):
+        assert client.get(url, params={"limit": bad}).status_code == 422, bad
+    # 边界值 1 与 100 合法
+    assert client.get(url, params={"limit": 1}).status_code == 200
+    assert client.get(url, params={"limit": 100}).status_code == 200
+    # 参数校验先于站点查询：站点不存在且 limit 非法时返回 422 而非 404
+    assert client.get("/sites/999/risk-history", params={"limit": 0}).status_code == 422
+
+
+def test_build_risk_history_treats_absent_product_as_streak_break():
+    # 直接对汇总函数建模：某频率在一条分析中连产物都不出现，同样终止连续计数。
+    from app.analysis import build_risk_history
+    from app.schemas import AnalysisResult, ProductOut
+
+    def product(freq, violates):
+        return ProductOut(
+            freq_hz=freq,
+            distance_hz=0,
+            hit={"type": "carrier", "carrier_hz": freq, "guard_band": None},
+            violates_guard_interval=violates,
+            sources=[{"fa_hz": freq, "fb_hz": freq + 1}],
+        )
+
+    def analysis(analysis_id, pairs):
+        return AnalysisResult(
+            analysis_id=analysis_id,
+            site_id=1,
+            created_at=f"2026-01-0{analysis_id}T00:00:00.000Z",
+            product_count=len(pairs),
+            products=[product(f, v) for f, v in pairs],
+        )
+
+    # 从新到旧：A={100 违规, 200 违规}，B={200 违规}（100 缺席），
+    # C={100 违规, 200 非违规}
+    results = [
+        analysis(3, [(100, True), (200, True)]),
+        analysis(2, [(200, True)]),
+        analysis(1, [(100, True), (200, False)]),
+    ]
+    assert [e.model_dump() for e in build_risk_history(results)] == [
+        {
+            "freq_hz": 100,
+            "violation_count": 2,
+            "last_violated_at": "2026-01-03T00:00:00.000Z",
+            "consecutive_count": 1,  # B 中 100 缺席，连续计数终止
+        },
+        {
+            "freq_hz": 200,
+            "violation_count": 2,
+            "last_violated_at": "2026-01-03T00:00:00.000Z",
+            "consecutive_count": 2,  # A、B 连续违规，C 非违规终止
+        },
+    ]
+    assert build_risk_history([]) == []
+

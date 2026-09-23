@@ -12,6 +12,7 @@ from .analysis import (
     build_cross_site_conflicts,
     build_mitigation_plan,
     build_risk_groups,
+    build_risk_history,
     carrier_exclusion_ranges,
     drift_risk_assessment,
 )
@@ -28,6 +29,7 @@ from .schemas import (
     ProductOut,
     RetentionResult,
     RiskGroup,
+    RiskHistoryEntry,
     SiteAnalysisRef,
     SiteCreate,
     SiteOut,
@@ -310,6 +312,39 @@ def list_site_analyses(site_id: int) -> list[AnalysisMeta]:
     if database.fetch_site(site_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
     return database.list_analyses(site_id)
+
+
+@app.get(
+    "/sites/{site_id}/risk-history",
+    response_model=list[RiskHistoryEntry],
+    tags=["analysis"],
+    summary="站点历史风险：最近 N 条已保存分析中各曾违规产物频率的违规统计",
+    description=(
+        "只读已保存分析结果，**不触发新分析**：按 **created_at、id 倒序**取该站点最近 "
+        "`limit` 条已保存分析（created_at 并列时以 id 较大者为更新），对在这些分析中"
+        "**至少违规过一次**（violates_guard_interval=true）的产物频率，返回：\n\n"
+        "- `violation_count`：窗口内该频率违规的分析条数；\n"
+        "- `last_violated_at`：该频率最近一次违规所在分析的创建时间；\n"
+        "- `consecutive_count`：从最新一条分析起向旧逐条统计的连续违规条数，"
+        "任一条分析中该频率未违规（产物未出现或标记为非违规）即终止计数，可为 0。\n\n"
+        "结果按 `freq_hz` 升序；窗口内无任何违规（含站点尚无分析记录）时返回空列表。"
+        "`limit` 取 1～100 的整数（缺失、越界或非整数 → 422）；站点不存在 → 404。"
+    ),
+)
+def get_site_risk_history(
+    site_id: int,
+    limit: int = Query(
+        ...,
+        ge=1,
+        le=100,
+        description="取最近 N 条已保存分析（按 created_at、id 倒序），取 1～100 的整数",
+    ),
+) -> list[RiskHistoryEntry]:
+    site = database.fetch_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    analyses = database.fetch_recent_analyses(site_id, limit)
+    return build_risk_history(analyses)
 
 
 @app.delete(

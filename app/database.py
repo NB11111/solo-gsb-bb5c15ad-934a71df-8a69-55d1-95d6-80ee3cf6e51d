@@ -369,6 +369,21 @@ def fetch_latest_analysis(site_id: int) -> AnalysisResult | None:
         return _row_to_result(row) if row else None
 
 
+def fetch_recent_analyses(site_id: int, limit: int) -> list[AnalysisResult]:
+    """读取该站点按 created_at、id 倒序的最近 limit 条已保存分析。
+
+    返回顺序为最新在前（created_at 并列时 id 较大者在前），与历史保留清理
+    的“最近”选取规则一致；仅读取已持久化结果，不触发任何分析。
+    """
+    with connect() as con:
+        rows = con.execute(
+            "SELECT * FROM analyses WHERE site_id = ?"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (site_id, limit),
+        ).fetchall()
+    return [_row_to_result(row) for row in rows]
+
+
 def list_analyses(site_id: int) -> list[AnalysisMeta]:
     with connect() as con:
         rows = con.execute(

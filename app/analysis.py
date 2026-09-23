@@ -15,6 +15,7 @@ from .schemas import (
     MitigationPlan,
     ProductOut,
     RiskGroup,
+    RiskHistoryEntry,
     SourcePair,
 )
 
@@ -622,6 +623,50 @@ def build_mitigation_plan(
             p.freq_hz for p in violating if p.freq_hz not in eliminated
         ],
     )
+
+
+def build_risk_history(analyses: Sequence[AnalysisResult]) -> list[RiskHistoryEntry]:
+    """基于已持久化的最近若干条分析，汇总每个曾违规产物频率的历史风险。
+
+    analyses 须按从新到旧（created_at、id 倒序）排列。对在窗口内至少违规
+    （violates_guard_interval=true）过一次的产物频率统计：违规出现次数、
+    最近一次违规所在分析的创建时间，以及从最新一条分析起的连续违规条数
+    ——逐条向旧计数，任一条分析中该频率未违规（产物未出现或标记为
+    非违规）即终止连续计数。结果按产物频率升序，稳定可复现；无任何违规
+    （含空历史）时返回空列表。
+    """
+    violating_per_analysis: list[set[int]] = []
+    violation_count: dict[int, int] = {}
+    last_violated_at: dict[int, str] = {}
+    for result in analyses:  # 从新到旧
+        freqs = {
+            p.freq_hz
+            for p in result.products
+            if p.violates_guard_interval
+        }
+        violating_per_analysis.append(freqs)
+        for freq in freqs:
+            violation_count[freq] = violation_count.get(freq, 0) + 1
+            # analyses 从新到旧：首次见到违规即最近一次违规，无需更新
+            last_violated_at.setdefault(freq, result.created_at)
+
+    entries: list[RiskHistoryEntry] = []
+    for freq in sorted(violation_count):
+        streak = 0
+        for freqs in violating_per_analysis:  # 从最新分析起向旧计数
+            if freq in freqs:
+                streak += 1
+            else:
+                break  # 未违规（产物不出现或标记非违规）终止连续计数
+        entries.append(
+            RiskHistoryEntry(
+                freq_hz=freq,
+                violation_count=violation_count[freq],
+                last_violated_at=last_violated_at[freq],
+                consecutive_count=streak,
+            )
+        )
+    return entries
 
 
 def carrier_exclusion_ranges(

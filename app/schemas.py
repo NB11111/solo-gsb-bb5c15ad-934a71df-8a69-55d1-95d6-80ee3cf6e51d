@@ -133,6 +133,26 @@ class RetentionResult(BaseModel):
     )
 
 
+class RiskHistoryEntry(BaseModel):
+    """站点最近 N 条已保存分析中，某曾违规产物频率的历史风险统计。"""
+
+    freq_hz: int = Field(..., description="曾违规的互调产物频率，整数 Hz；结果按该字段升序")
+    violation_count: int = Field(
+        ...,
+        description="最近 N 条分析中该频率违规（violates_guard_interval=true）的分析条数",
+    )
+    last_violated_at: str = Field(
+        ..., description="该频率最近一次违规所在分析的创建时间（created_at）"
+    )
+    consecutive_count: int = Field(
+        ...,
+        description=(
+            "从最新一条分析起向旧逐条统计的连续违规条数；任一条分析中该频率未违规"
+            "（产物不出现或 violates_guard_interval=false）即终止计数，可为 0"
+        ),
+    )
+
+
 class RiskGroup(BaseModel):
     """一个风险组：违规产物与其来源载频构成二部图后的一个连通分量。"""
 
