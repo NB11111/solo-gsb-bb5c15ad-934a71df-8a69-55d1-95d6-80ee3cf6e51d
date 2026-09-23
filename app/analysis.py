@@ -15,6 +15,7 @@ from .schemas import (
     MitigationPlan,
     ProductOut,
     RiskGroup,
+    RiskHistoryEntry,
     SourcePair,
 )
 
@@ -102,6 +103,57 @@ def analyze(
             )
         )
     return results
+
+
+def build_risk_history(analyses: Sequence[AnalysisResult]) -> list[RiskHistoryEntry]:
+    """汇总站点最近若干条**已保存**分析中违规产物频率的历史风险。
+
+    入参 analyses 必须已按 (created_at, id) 从新到旧排序（最新分析在前）。
+    对其中任何一条分析里曾 `violates_guard_interval` 的产物频率：
+    - violation_count：该频率在窗口内违规出现的分析条数；
+    - last_violated_at：最近一次违规所在分析的 created_at；
+    - consecutive_violation_count：从最新一条分析起向旧回溯的连续违规次数——
+      该频率在某条分析中未出现或未违规即终止计数；最新分析未违规（或未出现）
+      时连续次数为 0。
+    仅返回曾违规的频率，按频率升序；无任何违规时返回空列表。
+    """
+    violating_sets: list[set[int]] = []
+    for result in analyses:
+        violating_sets.append(
+            {p.freq_hz for p in result.products if p.violates_guard_interval}
+        )
+    if not analyses:
+        return []
+
+    # 从最新分析起逐条向旧：仅最新分析中违规的频率拥有计数（从 0 起）；计数中的
+    # 频率遇违规 +1，一旦在某条分析中未出现或未违规即“终止”（冻结累计值，之后
+    # 不再累加也不复活）。最新分析未违规或未出现的频率不在表中，取值为 0。
+    streak: dict[int, int] = {freq: 0 for freq in violating_sets[0]}
+    active: set[int] = set(streak)
+    for violating in violating_sets:
+        for freq in tuple(active):
+            if freq in violating:
+                streak[freq] += 1
+            else:
+                active.discard(freq)  # 终止：保留已累计值，旧分析中的再次违规不复活
+
+    counts: dict[int, int] = {}
+    last_violated_at: dict[int, str] = {}
+    for result, violating in zip(analyses, violating_sets):
+        for freq in violating:
+            counts[freq] = counts.get(freq, 0) + 1
+            # analyses 按新→旧遍历：仅首次（即最近一次违规）记录时间
+            last_violated_at.setdefault(freq, result.created_at)
+
+    return [
+        RiskHistoryEntry(
+            freq_hz=freq,
+            violation_count=counts[freq],
+            last_violated_at=last_violated_at[freq],
+            consecutive_violation_count=streak.get(freq, 0),
+        )
+        for freq in sorted(counts)
+    ]
 
 
 def build_risk_groups(products: list[ProductOut]) -> list[RiskGroup]:

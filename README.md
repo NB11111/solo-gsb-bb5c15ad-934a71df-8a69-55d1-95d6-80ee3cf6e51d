@@ -392,6 +392,39 @@ curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
 }
 ```
 
+## 站点历史风险查询（risk history）
+
+`GET /sites/{site_id}/risk-history?limit=N` 汇总该站点**已保存**分析中的违规产物频率历史，
+**仅读已持久化结果、不触发新分析**。查询参数 `limit` 为 **1～100 的整数**
+（缺失、越界或非整数 → `422`；站点不存在 → `404`）。
+
+- **窗口选取**：按 **`created_at`、`id` 从新到旧**（`created_at` 并列时以 id 较大者为更新，
+  与历史保留清理的“最近”口径一致）取最近 `limit` 条已保存分析。
+- **统计口径**：对窗口内**任何一条分析**中曾 `violates_guard_interval=true` 的产物频率返回：
+  - `violation_count`：该频率在窗口内违规出现的**分析条数**；
+  - `last_violated_at`：**最近一次**违规所在分析的 `created_at`；
+  - `consecutive_violation_count`：**从最新一条分析起**向旧回溯的连续违规次数——该频率在某条
+    分析中未出现或未违规即终止计数；最新分析未违规（或未出现）时为 `0`，终止后旧分析中的
+    再次违规不会“复活”计数。
+- **排序与空响应**：结果按产物**频率升序**；窗口内无任何违规（含站点尚无分析）时返回空列表 `[]`。
+
+```bash
+# 最近 10 条已保存分析中各违规产物频率的出现次数、最近违规时间与连续违规次数
+curl 'http://localhost:8000/sites/1/risk-history?limit=10'
+```
+
+```json
+[
+  {"freq_hz": 200, "violation_count": 3,
+   "last_violated_at": "2026-09-23T08:00:02.000Z", "consecutive_violation_count": 3},
+  {"freq_hz": 500, "violation_count": 4,
+   "last_violated_at": "2026-09-23T08:00:02.000Z", "consecutive_violation_count": 0}
+]
+```
+
+上例表示：频率 200 在最近 3 条分析中连续违规（共出现 3 次）；频率 500 共违规 4 次、最近一次
+就在最新分析之前，但**最新一条分析未违规**，故连续违规次数为 0。
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -415,6 +448,7 @@ curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
 | `POST` | `/sites/analyses/batch` | 多站点原子批量分析：1～10 个不重复站点 ID 按输入顺序逐站分析并在同一事务内保存，`201` 返回同序结果列表；任一站点不存在 → `404` 且整批不保存，任一步骤失败整批回滚 |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
+| `GET` | `/sites/{site_id}/risk-history?limit=N` | 最近 N 条（1～100，按 created_at、id 从新到旧）已保存分析中违规产物频率的违规次数、最近违规时间与从最新起连续违规次数；仅读已保存结果不触发分析，无违规返回空列表；站点不存在 → 404，参数非法 → 422 |
 | `DELETE` | `/sites/{site_id}/analyses/retention?keep=k` | 按 created_at、id 倒序保留最近 keep 条分析（1～100），单事务删除旧分析及其幂等键；站点不存在 → 404，参数非法 → 422 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
 | `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
@@ -454,6 +488,9 @@ curl -X POST http://localhost:8000/sites/analyses/batch \
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
 curl http://localhost:8000/sites/1/analysis
+
+# 查询站点历史风险：最近 10 条已保存分析中违规产物频率的出现次数、最近违规时间与连续违规次数
+curl 'http://localhost:8000/sites/1/risk-history?limit=10'
 
 # 清理分析历史：按 created_at、id 倒序保留最近 3 条，其余旧分析及其幂等键在单事务中删除
 curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
@@ -546,10 +583,11 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（82 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 运行测试（90 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
 # 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
 # 多站点原子批量分析的顺序一致、404 整批不保存与失败整批回滚，
-# 以及分析历史保留清理的倒序保留、幂等键联动删除与整批回滚）
+# 分析历史保留清理的倒序保留、幂等键联动删除与整批回滚，
+# 以及站点历史风险查询的违规计数/连续违规终止/窗口按 created_at、id 倒序与参数校验）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -566,9 +604,9 @@ uvicorn app.main:app --reload
 
 ```
 app/
-  main.py       # FastAPI 应用与路由，启动时初始化数据库（含单站分析与多站点原子批量分析）
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
-  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、多站点批量分析单事务提交、历史保留单事务清理、跨站点最近分析批量查询）
+  main.py       # FastAPI 应用与路由，启动时初始化数据库（含单站分析、多站点原子批量分析与站点历史风险查询）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合、历史风险汇总（违规计数与连续违规）
+  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、多站点批量分析单事务提交、历史保留单事务清理、站点最近分析窗口与跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）

@@ -1789,3 +1789,228 @@ def test_drift_risk_single_carrier_site_has_no_sources(client):
     assert resp.status_code == 200
     assert resp.json()["risk_count"] == 0
     assert resp.json()["risks"] == []
+
+
+# ---------------------------------------------------------------- 站点历史风险查询
+
+def _set_product_violation(analysis_id, freq_hz, violates):
+    """直接改写已保存分析 JSON 中某产物频率的违规标记（端点仅读持久化结果）。"""
+    import json
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        row = con.execute(
+            "SELECT result_json FROM analyses WHERE id = ?", (analysis_id,)
+        ).fetchone()
+        products = json.loads(row[0])
+        for product in products:
+            if product["freq_hz"] == freq_hz:
+                product["violates_guard_interval"] = violates
+        con.execute(
+            "UPDATE analyses SET result_json = ? WHERE id = ?",
+            (json.dumps(products), analysis_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_risk_history_empty_when_site_has_no_analysis(client):
+    # 站点存在但无分析：空列表（不报错，不触发分析）
+    client.post("/sites", json=make_payload())
+    resp = client.get("/sites/1/risk-history", params={"limit": 10})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == []
+    assert client.get("/sites/1/analyses").json() == []
+
+
+def test_risk_history_empty_when_no_violation(client):
+    # guard_interval_hz=0：所有分析均无违规产物 -> 空列表
+    client.post("/sites", json=make_payload(guard_interval_hz=0))
+    _create_n_analyses(client, 1, 3)
+    resp = client.get("/sites/1/risk-history", params={"limit": 10})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_risk_history_counts_streaks_and_window_limit(client):
+    # 默认站点（载频 [100,300,400]，g=150）：每次分析违规频率均为 {200, 500}，
+    # 非违规的 700 不出现
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 5)
+    metas = {m["analysis_id"]: m for m in client.get("/sites/1/analyses").json()}
+
+    resp = client.get("/sites/1/risk-history", params={"limit": 5})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == [
+        {
+            "freq_hz": 200,
+            "violation_count": 5,
+            "last_violated_at": metas[ids[4]]["created_at"],
+            "consecutive_violation_count": 5,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 5,
+            "last_violated_at": metas[ids[4]]["created_at"],
+            "consecutive_violation_count": 5,
+        },
+    ]
+
+    # limit=3：只统计最近 3 条（ids[2..4]），更早分析不计
+    body = client.get("/sites/1/risk-history", params={"limit": 3}).json()
+    assert [e["freq_hz"] for e in body] == [200, 500]
+    assert all(e["violation_count"] == 3 for e in body)
+    assert all(e["consecutive_violation_count"] == 3 for e in body)
+    assert all(e["last_violated_at"] == metas[ids[4]]["created_at"] for e in body)
+
+    # limit=1：只看最新一条
+    body = client.get("/sites/1/risk-history", params={"limit": 1}).json()
+    assert body == [
+        {
+            "freq_hz": 200,
+            "violation_count": 1,
+            "last_violated_at": metas[ids[4]]["created_at"],
+            "consecutive_violation_count": 1,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 1,
+            "last_violated_at": metas[ids[4]]["created_at"],
+            "consecutive_violation_count": 1,
+        },
+    ]
+
+    # 篡改已保存结果制造历史差异（id 从新到旧为 5,4,3,2,1）：
+    # 200：V,V,V（5/4/3），NV（2），V（1） -> 计数 4、连续 3、最近 t5
+    # 500：NV（5，最新即未违规），V（4/3/2/1） -> 计数 4、连续 0、最近 t4
+    _set_product_violation(ids[1], 200, False)
+    _set_product_violation(ids[4], 500, False)
+    body = client.get("/sites/1/risk-history", params={"limit": 5}).json()
+    assert body == [
+        {
+            "freq_hz": 200,
+            "violation_count": 4,
+            "last_violated_at": metas[ids[4]]["created_at"],
+            "consecutive_violation_count": 3,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 4,
+            "last_violated_at": metas[ids[3]]["created_at"],
+            "consecutive_violation_count": 0,
+        },
+    ]
+    # limit=3 时窗口仅 5/4/3：500 只在 4、3 违规 -> 计数 2、连续 0（最新未违规）
+    body = client.get("/sites/1/risk-history", params={"limit": 3}).json()
+    assert {(e["freq_hz"], e["violation_count"], e["consecutive_violation_count"])
+            for e in body} == {(200, 3, 3), (500, 2, 0)}
+
+
+def test_risk_history_orders_window_by_created_at_then_id(client):
+    # “最近 N”以 created_at 为主、id 为辅：把最旧 id 的记录改为最新时间后，
+    # 它应成为窗口首条并主导连续计数。
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 3)
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        con.execute(
+            "UPDATE analyses SET created_at = '2030-01-01T00:00:00.000Z' WHERE id = ?",
+            (ids[0],),
+        )
+        con.execute(
+            "UPDATE analyses SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?",
+            (ids[1],),
+        )
+        con.commit()
+    finally:
+        con.close()
+    # 新→旧顺序变为 ids[0](2030)、ids[2](今天)、ids[1](2020)
+
+    # 最新一条（ids[0]）中 200 改为未违规：连续计数立即终止为 0；
+    # 紧随其后的 ids[2] 违规 -> 连续 1；limit=2 窗口内计数 1。500 在两条中均违规
+    _set_product_violation(ids[0], 200, False)
+    metas = {m["analysis_id"]: m for m in client.get("/sites/1/analyses").json()}
+    body = client.get("/sites/1/risk-history", params={"limit": 2}).json()
+    assert body == [
+        {
+            "freq_hz": 200,
+            "violation_count": 1,
+            "last_violated_at": metas[ids[2]]["created_at"],
+            "consecutive_violation_count": 0,
+        },
+        {
+            "freq_hz": 500,
+            "violation_count": 2,
+            "last_violated_at": "2030-01-01T00:00:00.000Z",
+            "consecutive_violation_count": 2,
+        },
+    ]
+
+
+def test_risk_history_created_at_tie_uses_id_desc(client):
+    # created_at 完全相同时按 id 倒序取“最近”
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 3)
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        con.execute(
+            "UPDATE analyses SET created_at = '2026-01-01T00:00:00.000Z'"
+            " WHERE id IN (?, ?, ?)",
+            (*ids,),
+        )
+        con.commit()
+    finally:
+        con.close()
+    # limit=2 取 ids[2]、ids[1]；将 ids[2]（并列中 id 最大，视为最新）的
+    # 200 改为未违规 -> 连续为 0；ids[1] 仍违规 -> 计数 1
+    _set_product_violation(ids[2], 200, False)
+    body = client.get("/sites/1/risk-history", params={"limit": 2}).json()
+    entry_200 = next(e for e in body if e["freq_hz"] == 200)
+    assert entry_200["violation_count"] == 1
+    assert entry_200["consecutive_violation_count"] == 0
+    entry_500 = next(e for e in body if e["freq_hz"] == 500)
+    assert entry_500["violation_count"] == 2
+    assert entry_500["consecutive_violation_count"] == 2
+
+
+def test_risk_history_404_missing_site(client):
+    assert client.get("/sites/999/risk-history", params={"limit": 5}).status_code == 404
+    # 参数校验先于站点查询：非法 limit 对不存在站点仍返回 422
+    assert client.get("/sites/999/risk-history", params={"limit": 0}).status_code == 422
+
+
+def test_risk_history_422_invalid_limit(client):
+    client.post("/sites", json=make_payload())
+    url = "/sites/1/risk-history"
+    # 缺少 limit
+    assert client.get(url).status_code == 422
+    # 越界（0、负数、101）/ 非整数 -> 422
+    for bad in (0, -1, 101, 1000, "abc", 1.5):
+        assert client.get(url, params={"limit": bad}).status_code == 422, bad
+    # 边界值 1 与 100 合法
+    assert client.get(url, params={"limit": 1}).status_code == 200
+    assert client.get(url, params={"limit": 100}).status_code == 200
+
+
+def test_risk_history_is_read_only_and_reproducible(client):
+    # 仅读已保存结果：不新增分析；重复查询结果一致
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 2)
+    first = client.get("/sites/1/risk-history", params={"limit": 10})
+    assert first.status_code == 200
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == ids
+    second = client.get("/sites/1/risk-history", params={"limit": 10})
+    assert second.json() == first.json()
+
